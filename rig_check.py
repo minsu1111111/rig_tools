@@ -45,16 +45,14 @@ def _gray(img: np.ndarray) -> np.ndarray:
     return (g - g.mean()) / (g.std() + 1e-6)
 
 
-def parse_roi(spec: str | None, size: tuple[int, int]) -> tuple[int, int, int, int] | None:
+def _parse_one(spec: str, size: tuple[int, int]) -> tuple[int, int, int, int]:
     """Parse ``x,y,w,h``. Values <= 1 are read as fractions of the frame."""
-    if not spec:
-        return None
     try:
         nums = [float(v) for v in spec.split(",")]
     except ValueError:
-        die(f"bad --roi {spec!r}; expected x,y,w,h")
+        die(f"bad region {spec!r}; expected x,y,w,h")
     if len(nums) != 4:
-        die(f"bad --roi {spec!r}; expected 4 values x,y,w,h")
+        die(f"bad region {spec!r}; expected 4 values x,y,w,h, got {len(nums)}")
     w, h = size
     if all(v <= 1.0 for v in nums):
         nums = [nums[0] * w, nums[1] * h, nums[2] * w, nums[3] * h]
@@ -62,43 +60,93 @@ def parse_roi(spec: str | None, size: tuple[int, int]) -> tuple[int, int, int, i
     x, y = max(0, x), max(0, y)
     rw, rh = min(rw, w - x), min(rh, h - y)
     if rw < 8 or rh < 8:
-        die(f"--roi {spec!r} is degenerate for a {w}x{h} frame")
+        die(f"region {spec!r} is degenerate for a {w}x{h} frame")
     return x, y, rw, rh
 
 
-def _crop(img: np.ndarray, roi: tuple[int, int, int, int] | None) -> np.ndarray:
-    if roi is None:
-        return img
+def parse_rois(specs: list[str] | None, size: tuple[int, int]) -> list[tuple[int, int, int, int]]:
+    """Parse repeated --roi flags. Each may hold several regions split by ``;``."""
+    if not specs:
+        return []
+    out = []
+    for spec in specs:
+        for part in str(spec).split(";"):
+            part = part.strip()
+            if part:
+                out.append(_parse_one(part, size))
+    return out
+
+
+def normalise_stored(roi, size: tuple[int, int]) -> list[tuple[int, int, int, int]]:
+    """Read profile.roi, accepting both the old flat [x,y,w,h] and a list of them."""
+    if not roi:
+        return []
+    if all(isinstance(v, (int, float)) for v in roi):  # legacy single region
+        roi = [roi]
+    return [_parse_one(",".join(str(v) for v in r), size) for r in roi]
+
+
+def _crop(img: np.ndarray, roi) -> np.ndarray:
     x, y, w, h = roi
     return img[y : y + h, x : x + w]
 
 
-def compare(reference: np.ndarray, live: np.ndarray, roi=None) -> dict:
+def compare(reference: np.ndarray, live: np.ndarray, rois=None) -> dict:
+    """Compare over one or more windows.
+
+    Each window is scored independently, which is what makes several of them
+    useful: a camera that moved shifts every window together, while a single
+    bumped object only shifts the window containing it, and the per-region
+    breakdown tells you which happened.
+    """
     if live.shape != reference.shape:
         live = cv2.resize(live, (reference.shape[1], reference.shape[0]))
-    ref_g, live_g = _gray(_crop(reference, roi)), _gray(_crop(live, roi))
-    (dx, dy), response = cv2.phaseCorrelate(ref_g, live_g)
-    ncc = float((ref_g * live_g).mean())
+    regions = list(rois) if rois else [(0, 0, reference.shape[1], reference.shape[0])]
+
+    per = []
+    for r in regions:
+        ref_g, live_g = _gray(_crop(reference, r)), _gray(_crop(live, r))
+        (dx, dy), response = cv2.phaseCorrelate(ref_g, live_g)
+        per.append(
+            {
+                "region": list(r),
+                "dx_px": float(dx),
+                "dy_px": float(dy),
+                "shift_px": float(np.hypot(dx, dy)),
+                "correlation": float((ref_g * live_g).mean()),
+                "phase_response": float(response),
+            }
+        )
+
+    weights = np.array([r[2] * r[3] for r in regions], dtype=float)
+    weights /= weights.sum()
+    # Aggregate conservatively: any window that moved, or that stopped matching,
+    # should fail the check even if the others still look fine.
     return {
-        "dx_px": float(dx),
-        "dy_px": float(dy),
-        "shift_px": float(np.hypot(dx, dy)),
-        "correlation": ncc,
-        "phase_response": float(response),
-        "roi": list(roi) if roi else None,
+        "dx_px": float(sum(w * p["dx_px"] for w, p in zip(weights, per))),
+        "dy_px": float(sum(w * p["dy_px"] for w, p in zip(weights, per))),
+        "shift_px": max(p["shift_px"] for p in per),
+        "correlation": min(p["correlation"] for p in per),
+        "phase_response": min(p["phase_response"] for p in per),
+        "roi": [list(r) for r in regions] if rois else None,
+        "regions": per,
     }
 
 
-def overlay(reference: np.ndarray, live: np.ndarray, roi=None) -> np.ndarray:
+def overlay(reference: np.ndarray, live: np.ndarray, rois=None, per_region=None) -> np.ndarray:
     """Reference in green, live in magenta. They grey out where they agree."""
     if live.shape != reference.shape:
         live = cv2.resize(live, (reference.shape[1], reference.shape[0]))
     r = cv2.cvtColor(reference, cv2.COLOR_BGR2GRAY)
     l = cv2.cvtColor(live, cv2.COLOR_BGR2GRAY)
     out = cv2.merge([l, r, l])
-    if roi:
+    for i, roi in enumerate(rois or []):
         x, y, w, h = roi
-        cv2.rectangle(out, (x, y), (x + w, y + h), (0, 255, 255), 1)
+        colour = (0, 255, 255)
+        if per_region and i < len(per_region):
+            colour = (0, 255, 255) if per_region[i]["shift_px"] < 3 else (0, 128, 255)
+        cv2.rectangle(out, (x, y), (x + w, y + h), colour, 1)
+        cv2.putText(out, str(i), (x + 2, y + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.3, colour, 1)
     return out
 
 
@@ -179,7 +227,16 @@ def print_report(report: dict, ok: bool, name: str, args) -> None:
         f"magnitude {report['shift_px']:.1f} px (limit {args.max_shift:.1f})"
     )
     print(f"     correlation : {report['correlation']:.3f} (min {args.min_correlation:.2f})")
-    print(f"     window      : {report['roi'] or 'full frame'}")
+    regions = report.get("regions") or []
+    if len(regions) > 1:
+        print(f"     windows     : {len(regions)}  (worst values shown above)")
+        for i, p in enumerate(regions):
+            print(
+                f"       [{i}] {str(p['region']):<22} dx {p['dx_px']:+6.2f} dy {p['dy_px']:+6.2f}"
+                f"  shift {p['shift_px']:5.2f}  corr {p['correlation']:.3f}"
+            )
+    else:
+        print(f"     window      : {(report['roi'] or ['full frame'])[0]}")
     if not ok:
         print("\n     Nudge the mount and re-run; the window view makes it easier to see.")
         print("     Reference frame: " + str(Profile.dir_for(name) / "reference.png"))
@@ -190,8 +247,8 @@ def save_reference(args, frame: np.ndarray, fresh: bool) -> Profile:
     profile.camera = args.camera
     profile.height, profile.width = frame.shape[:2]
     profile.notes = args.notes or profile.notes
-    roi = parse_roi(args.roi, (profile.width, profile.height))
-    profile.roi = list(roi) if roi else profile.roi
+    rois = parse_rois(args.roi, (profile.width, profile.height))
+    profile.roi = [list(r) for r in rois] if rois else profile.roi
     if args.max_shift is not None:
         profile.max_shift = args.max_shift
     if args.min_correlation is not None:
@@ -200,7 +257,7 @@ def save_reference(args, frame: np.ndarray, fresh: bool) -> Profile:
     profile.save(reference=frame)
     print(f"{'created' if fresh else 'updated'} profile {profile.name!r} at {profile.dir}")
     print(f"  reference : {profile.reference_path} ({profile.width}x{profile.height})")
-    print(f"  window    : {profile.roi or 'full frame'}")
+    print(f"  windows   : {profile.roi or 'full frame'}")
     print(
         f"  limits    : shift <= {profile.max_shift or DEFAULT_MAX_SHIFT}, "
         f"corr >= {profile.min_correlation or DEFAULT_MIN_CORRELATION}"
@@ -215,10 +272,10 @@ def run_window(args, profile: Profile | None) -> int:
     cap = open_camera(args.camera, args.width, args.height)
     window = f"rig_check [{args.profile}]"
     reference = profile.load_reference() if profile else None
-    roi = None
+    rois = []
     if profile:
-        roi = parse_roi(args.roi, (profile.width, profile.height)) or (
-            tuple(profile.roi) if profile.roi else None
+        rois = parse_rois(args.roi, (profile.width, profile.height)) or normalise_stored(
+            profile.roi, (profile.width, profile.height)
         )
         print("reference | live | overlay (reference GREEN, live MAGENTA, aligned = grey)")
         print("SPACE = re-anchor to the current view, q or ESC = quit")
@@ -234,13 +291,13 @@ def run_window(args, profile: Profile | None) -> int:
                 continue
 
             if reference is not None:
-                report = compare(reference, frame, roi)
+                report = compare(reference, frame, rois)
                 ok = evaluate(report, args)
                 canvas = panels(
                     [
                         ("reference", reference),
                         ("live", frame),
-                        ("overlay", overlay(reference, frame, roi)),
+                        ("overlay", overlay(reference, frame, rois, report.get("regions"))),
                     ]
                 )
                 status = (
@@ -258,8 +315,8 @@ def run_window(args, profile: Profile | None) -> int:
             if key == 32:  # SPACE
                 profile = save_reference(args, frame, fresh=reference is None)
                 reference = profile.load_reference()
-                roi = parse_roi(args.roi, (profile.width, profile.height)) or (
-                    tuple(profile.roi) if profile.roi else None
+                rois = parse_rois(args.roi, (profile.width, profile.height)) or normalise_stored(
+                    profile.roi, (profile.width, profile.height)
                 )
             elif key in (ord("q"), 27):
                 break
@@ -283,9 +340,12 @@ def main() -> int:
     ap.add_argument("--height", type=int, default=None)
     ap.add_argument(
         "--roi",
+        action="append",
         default=None,
-        help="compare only this window 'x,y,w,h' (values <=1 are fractions). "
-        "Point it at scenery that never moves -- excluding the arm and the object "
+        metavar="x,y,w,h",
+        help="compare only this window (values <=1 are fractions). Repeat the flag, "
+        "or separate regions with ';', to use several: --roi 0,0,0.3,0.4 --roi 0.7,0,0.3,0.4. "
+        "Point them at scenery that never moves; leaving out the arm and the objects "
         "roughly halves the false-alarm rate. Stored in the profile when creating.",
     )
     # Thresholds resolve as: explicit flag > value stored in the profile > these.
@@ -326,10 +386,10 @@ def main() -> int:
         if fresh:
             die(f"profile {args.profile!r} does not exist yet; create it first")
         profile = Profile.load(args.profile)
-        roi = parse_roi(args.roi, (profile.width, profile.height)) or (
-            tuple(profile.roi) if profile.roi else None
+        rois = parse_rois(args.roi, (profile.width, profile.height)) or normalise_stored(
+            profile.roi, (profile.width, profile.height)
         )
-        return suggest_thresholds(args, profile, roi, args.suggest)
+        return suggest_thresholds(args, profile, rois, args.suggest)
 
     if not headless:
         return run_window(args, None if fresh else Profile.load(args.profile))
@@ -344,17 +404,17 @@ def main() -> int:
     profile = Profile.load(args.profile)
     reference = profile.load_reference()
     # an explicit --roi overrides whatever the profile was created with
-    roi = parse_roi(args.roi, (profile.width, profile.height)) or (
-        tuple(profile.roi) if profile.roi else None
+    rois = parse_rois(args.roi, (profile.width, profile.height)) or normalise_stored(
+        profile.roi, (profile.width, profile.height)
     )
     frame = grab(args.camera, args.width, args.height)
-    report = compare(reference, frame, roi)
+    report = compare(reference, frame, rois)
     ok = evaluate(report, args)
     report["profile"] = profile.name
     report["ok"] = ok
 
     if args.diff_out:
-        cv2.imwrite(args.diff_out, overlay(reference, frame, roi))
+        cv2.imwrite(args.diff_out, overlay(reference, frame, rois, report.get("regions")))
         if not args.quiet:
             print(f"wrote overlay to {args.diff_out}")
 

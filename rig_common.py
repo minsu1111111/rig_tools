@@ -96,8 +96,9 @@ class Profile:
     aruco_dict: str = "4x4_50"
     # marker id -> 4 corners [[x, y], ...] in the golden frame
     ref_corners: dict[str, list[list[float]]] = field(default_factory=dict)
-    # rig_check comparison window [x, y, w, h]; null means the whole frame
-    roi: list[int] | None = None
+    # rig_check comparison windows: a list of [x, y, w, h]. Null means the whole
+    # frame. A bare [x, y, w, h] from an older profile is still accepted.
+    roi: list | None = None
     # pass/fail thresholds, so the daily command needs no flags
     max_shift: float | None = None
     min_correlation: float | None = None
