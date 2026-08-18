@@ -220,6 +220,96 @@ def suggest_thresholds(args, profile: Profile, roi, n: int) -> int:
     return 0
 
 
+
+def propose_regions(frames: list, max_regions: int = 3, cell: int = 16) -> list:
+    """Pick comparison windows automatically from a burst of frames.
+
+    A good window is scenery that holds still while everything else moves, and
+    that has enough texture to correlate against. So score each cell of a grid by
+    texture divided by temporal variation, and keep the best connected blobs.
+    Feed it frames captured while the robot and the objects are actually moving --
+    that motion is the signal that tells the two apart.
+    """
+    stack = np.stack([cv2.cvtColor(f, cv2.COLOR_BGR2GRAY).astype(np.float32) for f in frames])
+    # Normalise each frame so a drifting exposure does not read as motion.
+    stack = (stack - stack.mean((1, 2), keepdims=True)) / (stack.std((1, 2), keepdims=True) + 1e-6)
+    motion = stack.std(0)
+    texture = np.abs(cv2.Laplacian(stack.mean(0), cv2.CV_32F))
+
+    h, w = motion.shape
+    gh, gw = h // cell, w // cell
+    m = motion[: gh * cell, : gw * cell].reshape(gh, cell, gw, cell).mean((1, 3))
+    t = texture[: gh * cell, : gw * cell].reshape(gh, cell, gw, cell).mean((1, 3))
+    score = t / (m + 0.05)
+
+    # Keep cells that are both quiet and textured, relative to this scene.
+    good = ((m < np.percentile(m, 55)) & (t > np.percentile(t, 45))).astype(np.uint8)
+    if good.sum() < 4:
+        good = (score > np.percentile(score, 75)).astype(np.uint8)
+    good = cv2.morphologyEx(good, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8))
+
+    n, lab, st, _ = cv2.connectedComponentsWithStats(good, 8)
+    blobs = sorted(
+        ((st[i], score[lab == i].mean()) for i in range(1, n) if st[i, 4] >= 4),
+        key=lambda z: -z[1],
+    )
+    out = []
+    for b, sc in blobs[:max_regions]:
+        x, y, bw, bh = b[0] * cell, b[1] * cell, b[2] * cell, b[3] * cell
+        if bw >= 2 * cell and bh >= cell:
+            out.append(((x, y, bw, bh), float(sc), float(m[b[1] : b[1] + b[3], b[0] : b[0] + b[2]].mean())))
+    return out
+
+
+def suggest_roi(args, n: int) -> int:
+    """Capture a burst, then print --roi flags for the stillest textured areas."""
+    cap = open_camera(args.camera, args.width, args.height)
+    frames = []
+    print(f"sampling {n} frames, one every {args.suggest_interval:.1f}s "
+          f"({n * args.suggest_interval:.0f}s total)")
+    print("MOVE THE ROBOT AND THE OBJECTS the whole time - that motion is what marks")
+    print("the areas to avoid. A still scene gives a useless answer.")
+    try:
+        for i in range(n):
+            if i:
+                time.sleep(args.suggest_interval)
+            f = None
+            for _ in range(6):
+                grabbed, x = cap.read()
+                if grabbed:
+                    f = x
+            if f is not None:
+                frames.append(f)
+                print(f"  {len(frames):3d}/{n}")
+    finally:
+        cap.release()
+
+    if len(frames) < 5:
+        die("need at least 5 frames; is the camera in use by another process?")
+
+    proposed = propose_regions(frames)
+    if not proposed:
+        die("found no stable textured area. Everything in view moves, or the scene is "
+            "featureless -- fix something textured in frame (a taped card, a jig, the "
+            "robot base) and retry.")
+
+    print(f"\nfound {len(proposed)} candidate window(s), stillest first:")
+    flags = []
+    for (x, y, w, h), sc, mo in proposed:
+        print(f"  {x},{y},{w},{h}   score {sc:6.1f}   motion {mo:.3f}")
+        flags.append(f"--roi {x},{y},{w},{h}")
+    print("\nCHECK THE PREVIEW before trusting these - a region that merely happened to")
+    print("hold still during the burst will cause false alarms later.")
+    if args.diff_out:
+        preview = overlay(frames[0], frames[-1], [p[0] for p in proposed])
+        cv2.imwrite(args.diff_out, preview)
+        print(f"wrote preview to {args.diff_out}")
+    print("\nuse them with:")
+    print(f"  python rig_tools/rig_check.py --camera {args.camera} --profile {args.profile} \\")
+    print(f"      --update {' '.join(flags)}")
+    return 0
+
+
 def print_report(report: dict, ok: bool, name: str, args) -> None:
     print(f"{'OK  ' if ok else 'FAIL'} view {'matches' if ok else 'drifted from'} profile {name!r}")
     print(
@@ -362,6 +452,15 @@ def main() -> int:
         "Move the arm and the objects around while it runs.",
     )
     ap.add_argument(
+        "--suggest-roi",
+        type=int,
+        default=0,
+        metavar="N",
+        help="sample N frames and propose comparison windows automatically, by finding "
+        "the areas that stay still while everything else moves. Move the robot and the "
+        "objects while it runs.",
+    )
+    ap.add_argument(
         "--suggest-interval",
         type=float,
         default=2.0,
@@ -381,6 +480,9 @@ def main() -> int:
     headless = (
         args.no_display or args.quiet or args.as_json or args.update or is_image_path(args.camera)
     )
+
+    if args.suggest_roi:
+        return suggest_roi(args, args.suggest_roi)
 
     if args.suggest:
         if fresh:
